@@ -1,0 +1,4 @@
+node_modules/
+.whisper-cache/
+.env
+.env.local

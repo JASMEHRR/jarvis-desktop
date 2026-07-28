@@ -1,0 +1,539 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  /* Per-pixel WebGL screen-edge glow. Every pixel's color is computed
+     independently as a continuous function of its position (a fragment
+     shader), not summed from discrete radial-gradient sources — that's what
+     "each pixel acts like an LED" (the user's own words) requires, and what
+     makes smoothness guaranteed by construction instead of tuned-for.
+     See SHADER-GLOW-PROMPT-v1.md. Replaces the canvas-2D 64-radial-source
+     renderer, which always left periodic scalloping between source centers
+     no matter how many sources or how much blur (three rejected attempts). */
+  html, body { margin: 0; background: transparent; overflow: hidden; width: 100vw; height: 100vh; }
+  canvas#glow {
+    position: fixed; inset: 0;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity .35s ease;
+  }
+  body.active canvas#glow { opacity: 1; }
+</style>
+</head>
+<body>
+  <canvas id="glow"></canvas>
+<script>
+  // ── tunables — every knob for the next tuning round lives here ──────────
+  const TUNE = {
+    bandWidth: 0.04,        // fraction of min(screen W,H) — brightest-to-near-zero band thickness
+    bandWidthLevel: 0.6,    // + this fraction of bandWidth at uLevel = 1
+    brightness: 0.78,       // base color multiplier at uLevel=0 — kept below the clamp so uLevel has visible headroom
+    brightnessLevel: 1.1,   // + this fraction of brightness at uLevel = 1
+    coreBoost: 0.65,        // additive white-hot spill right at the edge (also level-scaled, see shader)
+    noiseScale: 2.6,        // spatial frequency of the flow warp
+    noiseWarp: 0.42,        // how far the 2D domain warp drags the hue coordinate (was 0.09 — too weak to blend color across depth)
+    breatheAmount: 0.18,    // slow uneven brightness modulation along the band
+    falloffPower: 1.6,      // edge->interior falloff curve sharpness
+    depthWarpScale: 2.4,    // how far band-depth extends into the noise domain (makes hue vary ACROSS the band, not just around it)
+    hazeReach: 0.8,         // extended soft-aura reach as a multiple of bandWidth — barely past the core line
+    hazeOpacity: 0.08,      // peak opacity of the extended haze relative to the core
+    hazeFalloffPower: 1.6,  // haze falloff curve (gentler than the core's falloffPower)
+  };
+  const LAP_SECONDS = { listening: 30, thinking: 40, speaking: 22 }; // full palette lap duration
+  const STATE_GAIN = { listening: 1.0, thinking: 0.82, speaking: 1.15 }; // overall intensity multiplier per state
+  // Hue rotation (deg) applied on top of the palette per state — the only
+  // thing that previously varied between states was speed/intensity, so
+  // listening/thinking/speaking all looked identical in color. This shifts
+  // each state into a different part of the wheel: listening stays near the
+  // authored palette (warm->blue), thinking skews cool/violet ("processing"),
+  // speaking skews warm ("output").
+  const STATE_HUE_SHIFT = { listening: 0, thinking: 55, speaking: -35 };
+
+  // Electric blue/violet/pink palette (Siri-style) — unwrapped to a
+  // monotonic hue sequence so the ping-pong traversal below is a single
+  // scalar mix with no shortest-arc branch and no path through grey (which
+  // reads as "not vibrant").
+  const PALETTE = [
+    { h: 200, s: 95, l: 58 },   // electric blue
+    { h: 230, s: 92, l: 60 },   // indigo
+    { h: 265, s: 90, l: 58 },   // violet
+    { h: 300, s: 90, l: 60 },   // magenta
+    { h: 330, s: 92, l: 62 },   // pink
+    { h: 355, s: 90, l: 58 },   // rose (wraps back toward blue via the palindrome below)
+  ];
+
+  const canvas = document.getElementById('glow');
+  const gl = canvas.getContext('webgl', {
+    alpha: true,
+    premultipliedAlpha: false,
+    antialias: true,
+    preserveDrawingBuffer: false,
+  });
+
+  if (!gl) {
+    // Hard rule: do not fall back to the discrete radial-gradient technique.
+    console.error('[glow] WebGL unavailable — glow will not render. Not falling back to blob technique.');
+  }
+
+  // ── GLSL: build the palette lookup as a chained mix() ladder ────────────
+  // GLSL ES 1.00 fragment shaders can't reliably dynamically-index a uniform
+  // array by a non-constant expression, so the (small, fixed) palette is
+  // unrolled into a mix ladder at string-build time instead — keeps the
+  // palette editable as one JS array while staying spec-safe everywhere.
+  function buildPaletteGlsl() {
+    const n = PALETTE.length;
+    // Palindrome stop list: walk forward through all 6 stops, then back
+    // through the middle 4 (skipping the endpoints so they aren't visited
+    // twice in a row). A plain u=fract(t) sweep over [0,1) then walks this
+    // whole out-and-back sequence exactly once per lap, so the only seam is
+    // the small coral->orange step at the wrap (u=1 -> u=0) instead of the
+    // much larger orange<->blue jump a naive one-way cyclic wrap would have.
+    const stops = PALETTE.concat(PALETTE.slice(0, -1).reverse().slice(0, -1));
+    // stops.length === 2*(n-1); each stop gets an evenly spaced threshold.
+    const m = stops.length;
+    let glsl = `vec3 paletteHSL(float u) {\n  u = clamp(u, 0.0, 0.9999);\n  vec3 c = vec3(${stops[0].h.toFixed(2)}, ${(stops[0].s / 100).toFixed(4)}, ${(stops[0].l / 100).toFixed(4)});\n`;
+    for (let i = 1; i < m; i++) {
+      const t = i / m;
+      const s = stops[i];
+      glsl += `  c = mix(c, vec3(${s.h.toFixed(2)}, ${(s.s / 100).toFixed(4)}, ${(s.l / 100).toFixed(4)}), clamp((u - ${t.toFixed(6)}) * ${m}.0, 0.0, 1.0));\n`;
+    }
+    glsl += `  return c;\n}\n`;
+    return glsl;
+  }
+
+  const VERT_SRC = `
+    attribute vec2 aPos;
+    void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+  `;
+
+  // Ashima/Gustavson 2D simplex noise (MIT license), standard ~20-line GLSL
+  // snippet — no dependency, this is the well-known public-domain-equivalent
+  // implementation used across countless shader projects.
+  const NOISE_SRC = `
+    vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+    vec2 mod289(vec2 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+    vec3 permute(vec3 x) { return mod289(((x*34.0)+1.0)*x); }
+    float snoise(vec2 v) {
+      const vec4 C = vec4(0.211324865405187, 0.366025403784439,
+                          -0.577350269189626, 0.024390243902439);
+      vec2 i  = floor(v + dot(v, C.yy));
+      vec2 x0 = v -   i + dot(i, C.xx);
+      vec2 i1 = (x0.x > x0.y) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+      vec4 x12 = x0.xyxy + C.xxzz;
+      x12.xy -= i1;
+      i = mod289(i);
+      vec3 p = permute(permute(i.y + vec3(0.0, i1.y, 1.0)) + i.x + vec3(0.0, i1.x, 1.0));
+      vec3 m = max(0.5 - vec3(dot(x0,x0), dot(x12.xy,x12.xy), dot(x12.zw,x12.zw)), 0.0);
+      m = m*m; m = m*m;
+      vec3 x = 2.0 * fract(p * C.www) - 1.0;
+      vec3 h = abs(x) - 0.5;
+      vec3 ox = floor(x + 0.5);
+      vec3 a0 = x - ox;
+      m *= 1.79284291400159 - 0.85373472095314 * (a0*a0 + h*h);
+      vec3 g;
+      g.x = a0.x * x0.x + h.x * x0.y;
+      g.yz = a0.yz * x12.xz + h.yz * x12.yw;
+      return 130.0 * dot(m, g);
+    }
+  `;
+
+  // Iterated domain warping (Inigo Quilez's canonical GLSL technique: fbm,
+  // then fbm-of-fbm-offset, 2 levels deep) — feeding noise back into noise's
+  // input coordinate is what makes a field FOLD and BILLOW instead of just
+  // being nudged by a single noise sample. A single-sample warp (the old
+  // `noiseWarp` term) can only wiggle a 1D coordinate; this produces a real
+  // 2D turbulent field.
+  const WARP_SRC = `
+    float fbm(vec2 p) {
+      float f = 0.0;
+      float amp = 0.5;
+      for (int i = 0; i < 4; i++) {
+        f += amp * snoise(p);
+        p *= 2.02;
+        amp *= 0.5;
+      }
+      return f;
+    }
+
+    float domainWarp(vec2 p, float time) {
+      vec2 q = vec2(fbm(p + vec2(0.0, 0.0)),
+                    fbm(p + vec2(5.2, 1.3)));
+      vec2 r = vec2(fbm(p + 4.0 * q + vec2(1.7, 9.2) + time * 0.15),
+                    fbm(p + 4.0 * q + vec2(8.3, 2.8) + time * 0.126));
+      return fbm(p + 4.0 * r);
+    }
+  `;
+
+  const FRAG_SRC = `
+    precision highp float;
+    uniform vec2 uRes;
+    uniform float uTime;
+    uniform float uLevel;
+    uniform float uLap;
+    uniform float uGain;
+    uniform float uBandWidth;
+    uniform float uBandWidthLevel;
+    uniform float uBrightness;
+    uniform float uBrightnessLevel;
+    uniform float uCoreBoost;
+    uniform float uNoiseScale;
+    uniform float uNoiseWarp;
+    uniform float uBreatheAmount;
+    uniform float uFalloffPower;
+    uniform float uDepthWarpScale;
+    uniform float uHazeReach;
+    uniform float uHazeOpacity;
+    uniform float uHazeFalloffPower;
+    uniform float uHueShift;
+    #define TAU 6.28318530718
+
+    ${NOISE_SRC}
+    ${WARP_SRC}
+    ${buildPaletteGlsl()}
+
+    vec3 hsl2rgb(vec3 hsl) {
+      float h = mod(hsl.x, 360.0) / 360.0;
+      float s = hsl.y;
+      float l = hsl.z;
+      float c = (1.0 - abs(2.0 * l - 1.0)) * s;
+      float x = c * (1.0 - abs(mod(h * 6.0, 2.0) - 1.0));
+      float m = l - c * 0.5;
+      vec3 rgb;
+      if (h < 1.0/6.0) rgb = vec3(c, x, 0.0);
+      else if (h < 2.0/6.0) rgb = vec3(x, c, 0.0);
+      else if (h < 3.0/6.0) rgb = vec3(0.0, c, x);
+      else if (h < 4.0/6.0) rgb = vec3(0.0, x, c);
+      else if (h < 5.0/6.0) rgb = vec3(x, 0.0, c);
+      else rgb = vec3(c, 0.0, x);
+      return rgb + m;
+    }
+
+    void main() {
+      vec2 uv = gl_FragCoord.xy / uRes;
+
+      // Edge proximity, aspect-corrected: normalize by a single scalar
+      // (min screen dimension) rather than per-axis uv, so band thickness
+      // in physical pixels is identical on all four edges regardless of
+      // aspect ratio.
+      float minDim = min(uRes.x, uRes.y);
+      float dpx = min(min(gl_FragCoord.x, uRes.x - gl_FragCoord.x),
+                       min(gl_FragCoord.y, uRes.y - gl_FragCoord.y));
+      float d = dpx / minDim;
+
+      float band = uBandWidth * (1.0 + uLevel * uBandWidthLevel);
+      float coreIntensity = pow(1.0 - smoothstep(0.0, band, d), uFalloffPower);
+
+      // Perimeter position -> continuous angular coordinate, seamless wrap.
+      float t = atan(uv.y - 0.5, uv.x - 0.5) / TAU + 0.5;
+      t += uTime / uLap;
+
+      // Extended reach used by the haze falloff, and — critically — by the
+      // hue field's depth axis below.
+      float hazeBand = max(band * uHazeReach, 0.0001);
+      float depthN = clamp(d / hazeBand, 0.0, 1.6); // 0 at the edge, ~1 at the haze limit
+
+      // 2D domain-warped hue field. The old version built the palette
+      // coordinate from perimeter angle ONLY, so every pixel along an inward
+      // ray shared one hue — a clean line, not blending color. Here the
+      // sampled domain combines angle (on a circle, so it still wraps
+      // seamlessly) WITH depth-into-band, then runs iterated domain warping
+      // (see domainWarp above) so the resulting hue coordinate genuinely
+      // folds in two dimensions: colors bleed into each other across the
+      // band's thickness, not just around its perimeter.
+      vec2 angPos = vec2(cos(TAU * t), sin(TAU * t)) * uNoiseScale;
+      vec2 flowDrift = vec2(uTime * 0.11, -uTime * 0.09);
+      vec2 domain = angPos + vec2(depthN * uDepthWarpScale * 0.7, depthN * uDepthWarpScale * 1.3) + flowDrift;
+      float warp = domainWarp(domain, uTime * 0.2);
+      float tw = t + warp * uNoiseWarp;
+
+      // paletteHSL's stop ladder is already built as a there-and-back
+      // palindrome (see buildPaletteGlsl), so a single fract() sweep over
+      // [0,1) walks the full palette out and back exactly once per lap —
+      // ping-ponging this coordinate too would double-apply the palindrome
+      // and cycle the palette twice per lap instead of once.
+      float u = fract(tw);
+      vec3 hsl = paletteHSL(u);
+      hsl.x += uHueShift;
+      vec3 rgb = hsl2rgb(hsl);
+
+      // Soft extended haze: a second, much gentler falloff reaching further
+      // inward than the bright core, at low opacity, so the light fills the
+      // space instead of stopping at a crisp inner edge. The core stays the
+      // sharp bright band; this only adds a faint aura beyond it.
+      float hazeIntensity = pow(clamp(1.0 - smoothstep(0.0, hazeBand, d), 0.0, 1.0), uHazeFalloffPower) * uHazeOpacity;
+
+      float intensity = clamp(coreIntensity + hazeIntensity, 0.0, 1.0);
+
+      // Breathe: slower fourth noise field modulates intensity unevenly
+      // along the band length, subtle enough not to read as discrete spots.
+      float breathe = snoise(vec2(cos(TAU * t) * 1.3, sin(TAU * t) * 1.3) + uTime * 0.05);
+      intensity *= 1.0 + breathe * uBreatheAmount;
+      intensity = clamp(intensity, 0.0, 1.0);
+
+      // Vibrancy: uLevel drives brightness dramatically (audio reactivity
+      // must be unmistakable), plus an additive white-hot core near the very
+      // edge for a "light spilling in" quality. Multiplying rather than
+      // adding white preserves hue instead of desaturating toward white.
+      // The core boost is ALSO level-scaled (0.35x floor rising to 1x at
+      // full level): without this, the always-brightest edge pixel clamps
+      // to white the instant intensity=1 regardless of uLevel, leaving no
+      // visible headroom for "loud" to look any brighter than "silent".
+      // Uses coreIntensity (not the haze-augmented intensity) so the
+      // white-hot spill stays pinned to the true edge.
+      float bright = uBrightness * (1.0 + uLevel * uBrightnessLevel);
+      rgb *= bright;
+      float coreLevel = uCoreBoost * (0.35 + 0.65 * uLevel);
+      rgb += rgb * coreLevel * pow(coreIntensity, 5.0);
+      rgb = clamp(rgb, 0.0, 1.0);
+
+      float alpha = clamp(intensity * uGain, 0.0, 1.0);
+      gl_FragColor = vec4(rgb, alpha);
+    }
+  `;
+
+  // Separable 9-tap gaussian blur (radius ~3px), applied as a second render
+  // pass to the raw shader output. This is the belt-and-suspenders fix for
+  // per-pixel grain: even if the noise sampling above is well-behaved, this
+  // guarantees no single-pixel-wide artifact can survive to the screen.
+  const BLUR_FRAG_SRC = `
+    precision highp float;
+    uniform sampler2D uTex;
+    uniform vec2 uTexel;
+    uniform vec2 uDir;
+    void main() {
+      vec2 uv = gl_FragCoord.xy * uTexel;
+      vec4 sum = texture2D(uTex, uv) * 0.227027;
+      vec2 off1 = uDir * uTexel * 3.0;
+      vec2 off2 = uDir * uTexel * 7.0;
+      vec2 off3 = uDir * uTexel * 11.0;
+      vec2 off4 = uDir * uTexel * 15.0;
+      sum += (texture2D(uTex, uv + off1) + texture2D(uTex, uv - off1)) * 0.1945946;
+      sum += (texture2D(uTex, uv + off2) + texture2D(uTex, uv - off2)) * 0.1216216;
+      sum += (texture2D(uTex, uv + off3) + texture2D(uTex, uv - off3)) * 0.054054;
+      sum += (texture2D(uTex, uv + off4) + texture2D(uTex, uv - off4)) * 0.016216;
+      gl_FragColor = sum;
+    }
+  `;
+
+  function compileShader(type, src) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(sh);
+      gl.deleteShader(sh);
+      throw new Error('shader compile failed: ' + log);
+    }
+    return sh;
+  }
+
+  let program = null, uniforms = {}, posBuffer = null;
+  let blurProgram = null, blurUniforms = {};
+  let fboA = null, fboB = null; // A: raw shader output, B: horizontal-blur intermediate
+  let fboW = 0, fboH = 0;
+
+  function linkProgram(vsSrc, fsSrc) {
+    const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+    const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+    const p = gl.createProgram();
+    gl.attachShader(p, vs);
+    gl.attachShader(p, fs);
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      throw new Error('program link failed: ' + gl.getProgramInfoLog(p));
+    }
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+    return p;
+  }
+
+  function createFbo(w, h) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { fbo, tex };
+  }
+
+  function ensureFbos(w, h) {
+    if (w === fboW && h === fboH && fboA && fboB) return;
+    fboW = w; fboH = h;
+    fboA = createFbo(w, h);
+    fboB = createFbo(w, h);
+  }
+
+  function initGl() {
+    program = linkProgram(VERT_SRC, FRAG_SRC);
+    blurProgram = linkProgram(VERT_SRC, BLUR_FRAG_SRC);
+
+    posBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+    // Fullscreen triangle (covers the viewport with one triangle, no quad
+    // seam, standard trick — cheaper than two triangles for a full-screen pass).
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+
+    for (const p of [program, blurProgram]) {
+      const aPos = gl.getAttribLocation(p, 'aPos');
+      gl.enableVertexAttribArray(aPos);
+    }
+
+    uniforms = {};
+    for (const name of [
+      'uRes', 'uTime', 'uLevel', 'uLap', 'uGain', 'uBandWidth', 'uBandWidthLevel',
+      'uBrightness', 'uBrightnessLevel', 'uCoreBoost', 'uNoiseScale', 'uNoiseWarp',
+      'uBreatheAmount', 'uFalloffPower', 'uDepthWarpScale', 'uHazeReach', 'uHazeOpacity',
+      'uHazeFalloffPower', 'uHueShift',
+    ]) {
+      uniforms[name] = gl.getUniformLocation(program, name);
+    }
+    blurUniforms = {
+      uTex: gl.getUniformLocation(blurProgram, 'uTex'),
+      uTexel: gl.getUniformLocation(blurProgram, 'uTexel'),
+      uDir: gl.getUniformLocation(blurProgram, 'uDir'),
+    };
+
+    fboA = null; fboB = null; fboW = 0; fboH = 0;
+    if (canvas.width && canvas.height) ensureFbos(canvas.width, canvas.height);
+
+    gl.disable(gl.BLEND); // each pass writes final value per pixel; nothing composited
+    gl.clearColor(0, 0, 0, 0);
+  }
+
+  if (gl) {
+    initGl();
+    canvas.addEventListener('webglcontextlost', (e) => {
+      e.preventDefault();
+      console.warn('[glow] WebGL context lost');
+      if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+    });
+    canvas.addEventListener('webglcontextrestored', () => {
+      console.warn('[glow] WebGL context restored, reinitializing');
+      initGl();
+      if (state !== 'idle') { startTime = performance.now(); rafId = requestAnimationFrame(frame); }
+    });
+  }
+
+  let dpr = 1, W = 0, H = 0;
+
+  function resize() {
+    dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    if (gl) {
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      if (program) ensureFbos(canvas.width, canvas.height);
+    }
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ── state + audio-reactive level ────────────────────────────────
+  let state = 'idle';
+  let rawLevel = 0;      // last value reported over IPC (mic while listening, TTS/synthetic while speaking)
+  let level = 0;          // smoothed
+
+  function targetLevel(now) {
+    if (state === 'thinking') return 0.28 + 0.16 * (0.5 + 0.5 * Math.sin(now * 0.6)); // calm synthetic idle breathe
+    return rawLevel;
+  }
+
+  let rafId = null;
+  let startTime = 0;
+
+  function frame(ts) {
+    const now = (ts - startTime) / 1000;
+    level = level * 0.55 + targetLevel(now) * 0.45;
+
+    if (gl && program && fboA && fboB) {
+      const w = canvas.width, h = canvas.height;
+
+      // Pass 1: raw shader -> fboA.
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fboA.fbo);
+      gl.viewport(0, 0, w, h);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.useProgram(program);
+      gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+      gl.vertexAttribPointer(gl.getAttribLocation(program, 'aPos'), 2, gl.FLOAT, false, 0, 0);
+      gl.uniform2f(uniforms.uRes, w, h);
+      gl.uniform1f(uniforms.uTime, now);
+      gl.uniform1f(uniforms.uLevel, level);
+      gl.uniform1f(uniforms.uLap, LAP_SECONDS[state] || 40);
+      gl.uniform1f(uniforms.uGain, STATE_GAIN[state] || 1.0);
+      gl.uniform1f(uniforms.uBandWidth, TUNE.bandWidth);
+      gl.uniform1f(uniforms.uBandWidthLevel, TUNE.bandWidthLevel);
+      gl.uniform1f(uniforms.uBrightness, TUNE.brightness);
+      gl.uniform1f(uniforms.uBrightnessLevel, TUNE.brightnessLevel);
+      gl.uniform1f(uniforms.uCoreBoost, TUNE.coreBoost);
+      gl.uniform1f(uniforms.uNoiseScale, TUNE.noiseScale);
+      gl.uniform1f(uniforms.uNoiseWarp, TUNE.noiseWarp);
+      gl.uniform1f(uniforms.uBreatheAmount, TUNE.breatheAmount);
+      gl.uniform1f(uniforms.uFalloffPower, TUNE.falloffPower);
+      gl.uniform1f(uniforms.uDepthWarpScale, TUNE.depthWarpScale);
+      gl.uniform1f(uniforms.uHazeReach, TUNE.hazeReach);
+      gl.uniform1f(uniforms.uHazeOpacity, TUNE.hazeOpacity);
+      gl.uniform1f(uniforms.uHazeFalloffPower, TUNE.hazeFalloffPower);
+      gl.uniform1f(uniforms.uHueShift, STATE_HUE_SHIFT[state] || 0);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+      // Pass 2: horizontal blur, fboA -> fboB.
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fboB.fbo);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.useProgram(blurProgram);
+      gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+      gl.vertexAttribPointer(gl.getAttribLocation(blurProgram, 'aPos'), 2, gl.FLOAT, false, 0, 0);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, fboA.tex);
+      gl.uniform1i(blurUniforms.uTex, 0);
+      gl.uniform2f(blurUniforms.uTexel, 1 / w, 1 / h);
+      gl.uniform2f(blurUniforms.uDir, 1, 0);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+      // Pass 3: vertical blur, fboB -> screen.
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, w, h);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.bindTexture(gl.TEXTURE_2D, fboB.tex);
+      gl.uniform2f(blurUniforms.uDir, 0, 1);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+
+    rafId = requestAnimationFrame(frame);
+  }
+
+  function startGlow(nextState) {
+    state = nextState;
+    document.body.classList.add('active');
+    if (rafId) return; // loop already running — next frame reads the new state
+    startTime = performance.now();
+    rafId = requestAnimationFrame(frame);
+  }
+
+  function stopGlow() {
+    document.body.classList.remove('active');
+    if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+    if (gl) gl.clear(gl.COLOR_BUFFER_BIT);
+    level = 0; rawLevel = 0;
+  }
+
+  window.jarvisOverlay.onGlowState(({ state: s }) => {
+    if (!s || s === 'idle') stopGlow();
+    else startGlow(s);
+  });
+
+  window.jarvisOverlay.onGlowLevel(({ level: lv }) => {
+    if (typeof lv === 'number' && Number.isFinite(lv)) rawLevel = Math.min(1, Math.max(0, lv));
+  });
+</script>
+</body>
+</html>

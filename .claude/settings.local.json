@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm view *)",
+      "Bash(powershell -c \"Get-Content 'E:\\\\imp\\\\projects\\\\jarvis-desktop\\\\renderer\\\\index.html' -TotalCount 220\")"
+    ]
+  }
+}

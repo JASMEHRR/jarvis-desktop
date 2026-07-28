@@ -1,0 +1,786 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  :root { --brand: #22d3ee; }
+  html, body { margin: 0; background: transparent; overflow: hidden; font-family: 'Segoe UI', system-ui, sans-serif; }
+  body { width: 100vw; height: 100vh; display: flex; align-items: flex-end; justify-content: center; }
+  /* No visible widget in orb/dictate mode anymore — the screen-edge glow
+     overlay (renderer/overlay.html) is the sole state indicator now. */
+  @keyframes orbPulse { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
+  body.mode-orb .shell, body.mode-dictate .shell { display: none; }
+  body.mode-chat .shell { display: flex; }
+  .shell {
+    display: flex; flex-direction: column; height: 616px; margin: 12px; border-radius: 28px;
+    background: rgba(8, 12, 18, 0.86); border: 1px solid rgba(255,255,255,.12);
+    backdrop-filter: blur(28px); box-shadow: 0 20px 60px rgba(0,0,0,.6); overflow: hidden;
+  }
+  .head { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; border-bottom: 1px solid rgba(255,255,255,.08); }
+  .title { display: flex; align-items: center; gap: 10px; font-size: 10px; font-weight: 800; letter-spacing: .25em; text-transform: uppercase; color: rgba(255,255,255,.7); }
+  .orb { width: 8px; height: 8px; border-radius: 50%; background: #5b6472; }
+  .orb.thinking { background: #8b7cd8; animation: orbPulse .8s ease-in-out infinite; }
+  .headbtns { display: flex; gap: 6px; }
+  .hbtn { background: none; border: none; color: rgba(255,255,255,.55); cursor: pointer; font-size: 13px; padding: 5px 8px; border-radius: 999px; }
+  .hbtn:hover { background: rgba(255,255,255,.1); }
+  .chat { flex: 1; overflow-y: auto; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; }
+  .chat::-webkit-scrollbar { width: 5px; } .chat::-webkit-scrollbar-thumb { background: rgba(255,255,255,.15); border-radius: 3px; }
+  .msg { max-width: 85%; padding: 10px 14px; border-radius: 16px; font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { align-self: flex-end; background: rgba(34,211,238,.16); border: 1px solid rgba(34,211,238,.25); color: #fff; }
+  .msg.jarvis { align-self: flex-start; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.1); color: rgba(255,255,255,.92); }
+  .row { display: flex; align-items: center; gap: 8px; padding: 12px 16px 16px; }
+  .in {
+    flex: 1; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12); border-radius: 999px;
+    padding: 12px 18px; font-size: 13px; color: #fff; outline: none;
+  }
+  .in:focus { border-color: rgba(34,211,238,.45); }
+  .cbtn {
+    width: 42px; height: 42px; border-radius: 50%; border: 1px solid rgba(255,255,255,.12); flex: none;
+    background: rgba(255,255,255,.06); color: rgba(255,255,255,.75); cursor: pointer; font-size: 16px;
+  }
+  .cbtn:hover { background: rgba(255,255,255,.12); }
+  .cbtn.rec { background: rgba(244,63,94,.25); border-color: rgba(244,63,94,.5); color: #fda4af; }
+  .cbtn.send { background: rgba(34,211,238,.2); border-color: rgba(34,211,238,.4); color: #a5f3fc; }
+  .auth { flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 12px; padding: 0 48px; }
+  .auth input { background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12); border-radius: 12px; padding: 12px 16px; color: #fff; font-size: 13px; outline: none; }
+  .auth button { background: rgba(34,211,238,.2); border: 1px solid rgba(34,211,238,.4); border-radius: 12px; padding: 12px; color: #a5f3fc; font-size: 13px; font-weight: 700; cursor: pointer; }
+  .auth .err { color: #fda4af; font-size: 12px; min-height: 16px; }
+  .auth h2 { color: #fff; font-size: 16px; text-align: center; margin: 0 0 4px; }
+  .auth p { color: rgba(255,255,255,.45); font-size: 11px; text-align: center; margin: 0; }
+  .hint { text-align: center; color: rgba(255,255,255,.3); font-size: 10px; padding-bottom: 8px; }
+</style>
+</head>
+<body class="mode-orb">
+<div class="shell">
+  <div class="head">
+    <div class="title"><div class="orb" id="orb"></div> jarvis · desktop command core</div>
+    <div class="headbtns">
+      <button class="hbtn" id="muteBtn" title="Toggle voice replies">🔊</button>
+      <button class="hbtn" id="hideBtn" title="Hide (Esc)">✕</button>
+    </div>
+  </div>
+
+  <div class="auth" id="auth" style="display:none">
+    <h2>Sign in to Ascend</h2>
+    <input id="email" type="email" placeholder="Email" autocomplete="username" />
+    <input id="pass" type="password" placeholder="Password" autocomplete="current-password" />
+    <div class="err" id="authErr"></div>
+    <button id="loginBtn">Connect JARVIS</button>
+    <p>Same account as your Ascend web app. Google-only account? Use "Forgot password" on the web app once to set a password.</p>
+  </div>
+
+  <div class="chat" id="chat" style="display:none"></div>
+  <div class="row" id="inputRow" style="display:none">
+    <button class="cbtn" id="micBtn" title="Push to talk">🎤</button>
+    <input class="in" id="input" placeholder="Ask or command…" />
+    <button class="cbtn send" id="sendBtn" title="Send">➤</button>
+  </div>
+  <div class="hint">2x Right Shift summon · 2x Right Ctrl dictate anywhere · Esc / ✕ hide</div>
+</div>
+
+<script src="../config.js"></script>
+<script type="module">
+  import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js';
+  import {
+    getAuth, signInWithEmailAndPassword, onAuthStateChanged,
+  } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js';
+  import {
+    getFirestore, collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, query, where,
+  } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
+
+  const CFG = window.JARVIS_CONFIG;
+  const fbApp = initializeApp(CFG.firebase);
+  const auth = getAuth(fbApp);
+  const db = getFirestore(fbApp);
+
+  const $ = (id) => document.getElementById(id);
+  const chatEl = $('chat'), inputEl = $('input'), orb = $('orb');
+
+  // ── state (idle/listening/thinking/speaking) — reported to main, which
+  // forwards it to the screen-edge glow overlay window. `hint` is unused now
+  // that the old orb widget's text label is gone, kept for callers that still
+  // pass one so nothing needs to change at call sites.
+  function setOrb(state) {
+    window.jarvis.reportGlowState(state);
+  }
+
+  let uid = null;
+  let history = [];
+  let muted = false;
+  let thinking = false;
+  let reminders = [];           // live cache from Firestore
+  const timers = new Map();     // reminder id -> timeout handle
+
+  // ── UI helpers ────────────────────────────────────────────────
+  function addMsg(role, content) {
+    const div = document.createElement('div');
+    div.className = `msg ${role === 'user' ? 'user' : 'jarvis'}`;
+    div.textContent = content;
+    chatEl.appendChild(div);
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+
+  let orbSpeaking = false; // drives the orb's synthetic pulse during TTS
+
+  // ── speaking-state amplitude feed for the glow overlay ───────────
+  // Real TTS audio (ElevenLabs <audio> element) is analysed directly; browser
+  // speechSynthesis exposes no audio graph, so it falls back to a smooth
+  // synthetic pulse. Either way capped to one rAF loop (~60fps, within the
+  // overlay channel's 30-60fps budget) that stops the moment speech ends.
+  let ttsAudioCtx = null, ttsAnalyser = null, ttsLevelData = null, ttsSourceNode = null;
+  let speakPulseRaf = null;
+
+  function attachTtsAnalyser(audio) {
+    if (!ttsAudioCtx) ttsAudioCtx = new AudioContext();
+    if (ttsSourceNode) { try { ttsSourceNode.disconnect(); } catch { /* already gone */ } }
+    ttsSourceNode = ttsAudioCtx.createMediaElementSource(audio);
+    ttsAnalyser = ttsAudioCtx.createAnalyser();
+    ttsAnalyser.fftSize = 256;
+    ttsLevelData = new Uint8Array(ttsAnalyser.frequencyBinCount);
+    ttsSourceNode.connect(ttsAnalyser);
+    ttsAnalyser.connect(ttsAudioCtx.destination); // must still reach speakers — createMediaElementSource reroutes output
+  }
+
+  function startSpeakPulse(getLevel) {
+    stopSpeakPulse();
+    const loop = () => {
+      window.jarvis.reportGlowLevel(getLevel());
+      speakPulseRaf = requestAnimationFrame(loop);
+    };
+    speakPulseRaf = requestAnimationFrame(loop);
+  }
+
+  function stopSpeakPulse() {
+    if (speakPulseRaf) { cancelAnimationFrame(speakPulseRaf); speakPulseRaf = null; }
+    window.jarvis.reportGlowLevel(0);
+  }
+
+  // ── voice output: ElevenLabs first, browser speechSynthesis fallback ──
+  const ELEVEN_VOICE_ID = 'onwK4e9ZLuTAKqWW03F9'; // Daniel — British, authoritative
+  let ttsAudio = null;
+  let speakGen = 0; // bumped on every speak/stop so a stale fetch never plays over a newer one
+  let pendingSpeakDone = null; // onDone callback for the in-flight speak(), if any
+
+  function stopSpeaking() {
+    speakGen++;
+    if ('speechSynthesis' in window) speechSynthesis.cancel();
+    if (ttsAudio) { ttsAudio.pause(); ttsAudio = null; }
+    stopSpeakPulse();
+    orbSpeaking = false;
+    setOrb('idle');
+    if (pendingSpeakDone) { const d = pendingSpeakDone; pendingSpeakDone = null; d(); }
+  }
+
+  function speakBrowser(text, onDone) {
+    if (!('speechSynthesis' in window)) { if (onDone) onDone(); return; }
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 1.2; u.pitch = 0.9;
+    const vs = speechSynthesis.getVoices();
+    u.voice = vs.find(v => /en[-_]GB/i.test(v.lang) && /male|george|ryan/i.test(v.name))
+      || vs.find(v => /en[-_]GB/i.test(v.lang)) || vs.find(v => /en/i.test(v.lang)) || null;
+    u.onstart = () => {
+      orbSpeaking = true; setOrb('speaking');
+      // No audio graph access for speechSynthesis — synthesize a smooth
+      // voice-like pulse instead of a flat level.
+      const t0 = performance.now();
+      startSpeakPulse(() => 0.35 + 0.3 * Math.abs(Math.sin((performance.now() - t0) / 140)));
+    };
+    u.onend = u.onerror = () => { stopSpeakPulse(); orbSpeaking = false; setOrb('idle'); if (onDone) onDone(); };
+    speechSynthesis.speak(u);
+  }
+
+  async function speakEleven(text, gen, onDone) {
+    try {
+      const res = await fetch(`${CFG.API_BASE}/api/tts`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, voiceId: ELEVEN_VOICE_ID }),
+      });
+      if (gen !== speakGen) return; // superseded while fetching
+      if (!res.ok) {
+        let code = '';
+        try { code = String((await res.json())?.code ?? ''); } catch { /* non-JSON error body */ }
+        console.warn('[tts] eleven unavailable, falling back to browser voice:', code || res.status);
+        speakBrowser(text, onDone);
+        return;
+      }
+      const blob = await res.blob();
+      if (gen !== speakGen) return;
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audio.playbackRate = 1.2; // snappier replies; Audio.playbackRate preserves pitch at this multiplier
+      ttsAudio = audio;
+      const done = () => {
+        URL.revokeObjectURL(url);
+        stopSpeakPulse();
+        if (ttsAudio === audio) { ttsAudio = null; orbSpeaking = false; }
+      };
+      audio.onplay = () => {
+        orbSpeaking = true; setOrb('speaking');
+        try {
+          attachTtsAnalyser(audio);
+          startSpeakPulse(() => {
+            ttsAnalyser.getByteFrequencyData(ttsLevelData);
+            let sum = 0;
+            for (let i = 0; i < ttsLevelData.length; i++) sum += ttsLevelData[i];
+            return sum / ttsLevelData.length / 255;
+          });
+        } catch (e) {
+          // WebAudio graph on the media element failed (e.g. CSP/codec edge
+          // case) — fall back to a synthetic pulse so the glow still reacts.
+          console.warn('[tts] analyser attach failed, using synthetic pulse:', e.message);
+          const t0 = performance.now();
+          startSpeakPulse(() => 0.35 + 0.3 * Math.abs(Math.sin((performance.now() - t0) / 140)));
+        }
+      };
+      audio.onended = () => { done(); setOrb('idle'); if (onDone) onDone(); };
+      audio.onerror = () => { done(); setOrb('idle'); if (onDone) onDone(); };
+      await audio.play();
+    } catch (e) {
+      if (gen === speakGen) { console.warn('[tts] eleven request failed, falling back:', e.message); speakBrowser(text, onDone); }
+    }
+  }
+
+  // onDone fires once the reply has finished being spoken (or immediately if
+  // muted/superseded) — the orb-conversation loop uses it to re-arm the mic.
+  function speak(text, onDone) {
+    if (muted) { if (onDone) onDone(); return; }
+    stopSpeaking();
+    pendingSpeakDone = onDone || null;
+    speakEleven(text, speakGen, () => { pendingSpeakDone = null; if (onDone) onDone(); });
+  }
+
+  // ── reminders (Firestore users/{uid}/reminders) ───────────────
+  // Doc shape: { text, dueAt: ISO string, done: bool, notified: bool, createdAt: ISO, source: 'desktop'|'web' }
+  function remindersRef() { return collection(db, 'users', uid, 'reminders'); }
+
+  function scheduleReminder(id, r) {
+    if (timers.has(id)) { clearTimeout(timers.get(id)); timers.delete(id); }
+    if (r.done || r.notified) return;
+    const delay = new Date(r.dueAt).getTime() - Date.now();
+    const fire = async () => {
+      timers.delete(id);
+      window.jarvis.reminderDue(r.text);
+      addMsg('jarvis', `⏰ Reminder: ${r.text}`);
+      speak(`Reminder, sir: ${r.text}`);
+      try { await updateDoc(doc(db, 'users', uid, 'reminders', id), { notified: true }); }
+      catch (e) { console.warn('mark notified failed', e); }
+    };
+    const MAX_TIMEOUT_MS = 2147000000; // setTimeout's 32-bit signed-int cap (~24.8 days)
+    if (delay <= 0) fire();                       // missed while app was closed → fire late
+    else if (delay <= MAX_TIMEOUT_MS) timers.set(id, setTimeout(fire, delay));
+    // Reminder is further away than one timer can cover — wait out the cap,
+    // then recompute; chains until it's within range instead of silently
+    // never firing for anything set more than ~25 days ahead.
+    else timers.set(id, setTimeout(() => scheduleReminder(id, r), MAX_TIMEOUT_MS));
+  }
+
+  function watchReminders() {
+    const q = query(remindersRef(), where('done', '==', false));
+    onSnapshot(q, (snap) => {
+      reminders = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      snap.docChanges().forEach(ch => {
+        if (ch.type === 'removed') { clearTimeout(timers.get(ch.doc.id)); timers.delete(ch.doc.id); }
+        else scheduleReminder(ch.doc.id, ch.doc.data());
+      });
+    }, (err) => console.warn('[reminders] listener error:', err.message));
+  }
+
+  const fuzzy = (a, b) => a.toLowerCase().includes(b.toLowerCase()) || b.toLowerCase().includes(a.toLowerCase());
+
+  // ── Jarvis tools (declared to the relay, executed locally) ────
+  const TOOLS = [
+    { name: 'set_reminder', module: 'reminders', description: 'Create a reminder that will pop up on desktop and in Ascend at the given time', parameters: { text: 'what to remind', time: 'ISO 8601 local datetime, e.g. 2026-07-19T18:30:00' } },
+    { name: 'complete_reminder', module: 'reminders', description: 'Mark a pending reminder as done', parameters: { match: 'words from the reminder text' } },
+    { name: 'delete_reminder', module: 'reminders', description: 'Delete a pending reminder entirely', parameters: { match: 'words from the reminder text' } },
+    { name: 'type_text', module: 'desktop', description: 'Type the given text into the app the user was last using (dictation-style). Use when asked to write/type something for the user in another app', parameters: { text: 'the exact text to type' } },
+  ];
+
+  async function runTool(call) {
+    const args = call.args || {};
+    switch (call.tool) {
+      case 'set_reminder': {
+        if (!args.text || !args.time || isNaN(new Date(args.time).getTime())) return 'reminder failed (bad time)';
+        await addDoc(remindersRef(), {
+          text: String(args.text), dueAt: new Date(args.time).toISOString(),
+          done: false, notified: false, createdAt: new Date().toISOString(), source: 'desktop',
+        });
+        return `reminder set for ${new Date(args.time).toLocaleString()}`;
+      }
+      case 'complete_reminder':
+      case 'delete_reminder': {
+        if (!args.match) return 'no match given';
+        const hit = reminders.find(r => fuzzy(r.text, String(args.match)));
+        if (!hit) return 'no matching reminder';
+        if (call.tool === 'complete_reminder') await updateDoc(doc(db, 'users', uid, 'reminders', hit.id), { done: true });
+        else await deleteDoc(doc(db, 'users', uid, 'reminders', hit.id));
+        return `reminder ${call.tool === 'complete_reminder' ? 'completed' : 'deleted'}`;
+      }
+      case 'type_text': {
+        if (!args.text) return 'nothing to type';
+        window.jarvis.hide(); // give focus back to the target app first
+        await new Promise(r => setTimeout(r, 400));
+        const ok = await window.jarvis.typeText(String(args.text));
+        return ok ? 'typed' : 'copied to clipboard (paste with Ctrl+V)';
+      }
+      default: return `unknown tool: ${call.tool}`;
+    }
+  }
+
+  // ── chat ──────────────────────────────────────────────────────
+  async function send(raw, onSpoken) {
+    const text = raw.trim();
+    if (!text || thinking) { if (onSpoken) onSpoken(); return; }
+    addMsg('user', text);
+    history.push({ role: 'user', content: text });
+    if (history.length > 24) history = history.slice(-24);
+    inputEl.value = '';
+    thinking = true; orb.classList.add('thinking');
+
+    const context = {
+      now: new Date().toString(),
+      timezoneOffsetMinutes: new Date().getTimezoneOffset(),
+      surface: 'desktop app (Windows). You can set reminders and type text into other apps.',
+      pendingReminders: reminders.map(r => ({ text: r.text, dueAt: r.dueAt })),
+    };
+
+    try {
+      const res = await fetch(`${CFG.API_BASE}/api/jarvis`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ history, context, tools: TOOLS }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error((data && data.error) || `Server error ${res.status}`);
+
+      const results = [];
+      for (const call of Array.isArray(data.toolCalls) ? data.toolCalls : []) {
+        try { results.push(await runTool(call)); }
+        catch (e) { results.push(`${call.tool} failed: ${e.message}`); }
+      }
+      const reply = data.reply || '…';
+      addMsg('jarvis', results.length ? `${reply}\n\n✓ ${results.join(' · ')}` : reply);
+      history.push({ role: 'assistant', content: reply });
+      speak(reply);
+    } catch (err) {
+      addMsg('jarvis', `Connection issue: ${err.message}. Try again, sir.`);
+    } finally {
+      thinking = false; orb.classList.remove('thinking');
+    }
+  }
+
+  // ── mic capture: raw 16kHz mono PCM for local Whisper (no MediaRecorder/webm) ──
+  const WHISPER_SAMPLE_RATE = 16000;
+  const MIN_SAMPLES = WHISPER_SAMPLE_RATE * 0.3; // shorter than this isn't real speech
+
+  function resampleTo16k(chunks, totalLen, srcRate) {
+    const src = new Float32Array(totalLen);
+    let off = 0;
+    for (const c of chunks) { src.set(c, off); off += c.length; }
+    if (srcRate === WHISPER_SAMPLE_RATE) return src;
+    const ratio = srcRate / WHISPER_SAMPLE_RATE;
+    const out = new Float32Array(Math.floor(src.length / ratio));
+    for (let i = 0; i < out.length; i++) {
+      const srcIdx = i * ratio;
+      const i0 = Math.floor(srcIdx), i1 = Math.min(i0 + 1, src.length - 1);
+      const frac = srcIdx - i0;
+      out[i] = src[i0] * (1 - frac) + src[i1] * frac;
+    }
+    return out;
+  }
+
+  // Taps the stream via a ScriptProcessorNode (no separate worklet file needed)
+  // routed through a silent gain node so it never plays back audibly.
+  function tapPcm(stream, ctx) {
+    const source = ctx.createMediaStreamSource(stream);
+    const processor = ctx.createScriptProcessor(4096, 1, 1);
+    const silentGain = ctx.createGain();
+    silentGain.gain.value = 0;
+    const chunks = [];
+    let totalLen = 0;
+    processor.onaudioprocess = (e) => {
+      const data = e.inputBuffer.getChannelData(0);
+      chunks.push(new Float32Array(data));
+      totalLen += data.length;
+    };
+    source.connect(processor);
+    processor.connect(silentGain);
+    silentGain.connect(ctx.destination);
+    return {
+      stop() { source.disconnect(); processor.disconnect(); silentGain.disconnect(); processor.onaudioprocess = null; },
+      samples() { return resampleTo16k(chunks, totalLen, ctx.sampleRate); },
+    };
+  }
+
+  async function transcribeSamples(samples) {
+    const { text, error } = await window.jarvis.transcribe(samples.buffer);
+    if (error) throw new Error(error);
+    return (text || '').trim();
+  }
+
+  // ── manual recorder: explicit start()/stop() only, no auto-stop ──────
+  // Used by dictation and the chat mic button — both are start-on-command,
+  // stop-on-command with no silence detection.
+  function createManualPcmRecorder() {
+    let stream = null, ctx = null, tap = null, analyser = null, levelData = null;
+    async function start() {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      ctx = new AudioContext();
+      // Analyser tap runs alongside (not instead of) the PCM tap below —
+      // purely for glow-level metering, never touches the samples used for
+      // transcription.
+      analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      levelData = new Uint8Array(analyser.frequencyBinCount);
+      ctx.createMediaStreamSource(stream).connect(analyser);
+      tap = tapPcm(stream, ctx);
+    }
+    function rawLevel() {
+      if (!analyser) return 0;
+      analyser.getByteFrequencyData(levelData);
+      let sum = 0;
+      for (let i = 0; i < levelData.length; i++) sum += levelData[i];
+      return sum / levelData.length / 255;
+    }
+    function stop() {
+      const samples = tap ? tap.samples() : new Float32Array(0);
+      if (tap) { tap.stop(); tap = null; }
+      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+      if (ctx) { ctx.close(); ctx = null; }
+      analyser = null;
+      return samples;
+    }
+    return { start, stop, rawLevel };
+  }
+
+  // ── auto-stop-on-silence recorder — orb conversation loop ONLY ───────
+  // Dictation used to share this logic but now stops purely on the second
+  // double-tap (see createManualPcmRecorder above); this auto-silence
+  // behavior is intentionally unchanged for the orb-to-Jarvis loop.
+  // Calibrates the noise floor per-session (ambient baseline + delta) instead
+  // of a fixed number, since a fixed absolute threshold is wrong in a quiet
+  // room vs. a noisy one, or for someone who speaks softly. Waits for
+  // SILENCE_MS of continued quiet before ending a turn (not just NOISE_FLOOR-
+  // crossing once) — resumed speech before that timer fires cancels the
+  // pending stop, so a mid-sentence breath doesn't truncate the recording.
+  const VT_TICK_MS = 100;
+  const VT_MIN_SPEECH_MS = 600;
+  const VT_SILENCE_MS = 1700;        // was 1100 — too eager, cut sentences off mid-pause
+  const VT_CALIBRATION_MS = 350;
+  const VT_NOISE_DELTA = 0.045;      // speech threshold = calibrated ambient baseline + this
+  const VT_MIN_NOISE_FLOOR = 0.02, VT_MAX_NOISE_FLOOR = 0.2; // sane bounds either way
+  const VT_SAFETY_MS = 120000;
+
+  function createVoiceTurn() {
+    let stream = null, ctx = null, tap = null, analyser = null, levelData = null;
+    let noiseFloor = 0.08; // fallback until calibration finishes
+    let speechMs = 0, hasSpoken = false, calibrating = false, calibSum = 0, calibN = 0, calibStart = 0;
+    let silenceTimer = null, safetyTimer = null, tickInterval = null;
+    let resolveDone = null, finished = false;
+
+    function rawLevel() {
+      analyser.getByteFrequencyData(levelData);
+      let sum = 0;
+      for (let i = 0; i < levelData.length; i++) sum += levelData[i];
+      return sum / levelData.length / 255;
+    }
+
+    function tick() {
+      if (!analyser) return;
+      const raw = rawLevel();
+      if (calibrating) {
+        calibSum += raw; calibN++;
+        if (Date.now() - calibStart >= VT_CALIBRATION_MS) {
+          calibrating = false;
+          const avg = calibN ? calibSum / calibN : 0.08;
+          noiseFloor = Math.min(VT_MAX_NOISE_FLOOR, Math.max(VT_MIN_NOISE_FLOOR, avg + VT_NOISE_DELTA));
+        }
+        return;
+      }
+      if (raw > noiseFloor) {
+        speechMs += VT_TICK_MS;
+        if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+        if (speechMs >= VT_MIN_SPEECH_MS) hasSpoken = true;
+      } else if (hasSpoken && !silenceTimer) {
+        silenceTimer = setTimeout(stop, VT_SILENCE_MS);
+      }
+    }
+
+    async function start() {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      ctx = new AudioContext();
+      analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      levelData = new Uint8Array(analyser.frequencyBinCount);
+      ctx.createMediaStreamSource(stream).connect(analyser);
+      tap = tapPcm(stream, ctx);
+      calibrating = true; calibSum = 0; calibN = 0; calibStart = Date.now();
+      speechMs = 0; hasSpoken = false;
+      safetyTimer = setTimeout(stop, VT_SAFETY_MS);
+      tickInterval = setInterval(tick, VT_TICK_MS);
+      // Glow-level reporting runs on its own rAF loop, decoupled from the
+      // 100ms VAD tick above (which only needs to run that slowly for
+      // calibration/silence-detection) — the overlay's audio-reactive swell
+      // was visibly steppy at 10Hz.
+      startSpeakPulse(rawLevel);
+      return stream;
+    }
+
+    function teardown() {
+      clearInterval(tickInterval); tickInterval = null;
+      clearTimeout(silenceTimer); silenceTimer = null;
+      clearTimeout(safetyTimer); safetyTimer = null;
+      stopSpeakPulse();
+      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+      if (ctx) { ctx.close(); ctx = null; }
+      analyser = null;
+    }
+
+    function stop() {
+      if (finished) return;
+      finished = true;
+      const samples = tap ? tap.samples() : new Float32Array(0);
+      if (tap) { tap.stop(); tap = null; }
+      teardown();
+      if (resolveDone) { const r = resolveDone; resolveDone = null; r(samples); }
+    }
+
+    function abort() {
+      if (finished) return;
+      finished = true;
+      if (tap) { tap.stop(); tap = null; }
+      teardown();
+      if (resolveDone) { const r = resolveDone; resolveDone = null; r(new Float32Array(0)); }
+    }
+
+    function done() { return new Promise((resolve) => { resolveDone = resolve; }); }
+
+    return { start, stop, abort, done };
+  }
+
+  // ── orb-click conversation loop (unchanged auto-stop-on-silence behavior) ──
+  let convoActive = false;
+  let convoTurn = null;
+  const CONVO_NO_SPEECH_END_MS = 9000;
+  let convoIdleTimer = null;
+
+  function orbClick() {
+    if (document.body.classList.contains('mode-dictate')) return;
+    if (convoActive) { endConvo(); return; }
+    convoActive = true;
+    startConvoTurn();
+  }
+
+  function endConvo() {
+    convoActive = false;
+    clearTimeout(convoIdleTimer); convoIdleTimer = null;
+    if (convoTurn) convoTurn.abort();
+    stopSpeaking(); // cuts off an in-progress reply and resolves any pending turn
+    setOrb('idle', 'click to talk');
+  }
+
+  async function startConvoTurn() {
+    if (!convoActive) return;
+    convoTurn = createVoiceTurn();
+    try { await convoTurn.start(); }
+    catch {
+      addMsg('jarvis', 'Mic blocked — allow microphone access for JARVIS in Windows settings.');
+      endConvo();
+      return;
+    }
+    // End the whole loop (not just this turn) if the user says nothing at all.
+    convoIdleTimer = setTimeout(() => { convoActive = false; convoTurn.stop(); }, CONVO_NO_SPEECH_END_MS);
+    setOrb('listening', 'listening…');
+    const samples = await convoTurn.done();
+    clearTimeout(convoIdleTimer); convoIdleTimer = null;
+    await finishConvoTurn(samples);
+  }
+
+  function sendConvo(text) {
+    return new Promise((resolve) => { send(text, resolve); });
+  }
+
+  async function finishConvoTurn(samples) {
+    if (!convoActive) { setOrb('idle', 'click to talk'); return; }
+    if (samples.length < MIN_SAMPLES) {
+      setOrb('idle', "didn't catch that");
+      window.jarvis.notify('JARVIS', "Didn't catch that — try again.");
+      endConvo();
+      return;
+    }
+
+    setOrb('thinking', 'thinking…');
+    try {
+      const text = await transcribeSamples(samples);
+      if (!text) {
+        setOrb('idle', "didn't catch that");
+        window.jarvis.notify('JARVIS', "Didn't catch that — try again.");
+        endConvo();
+        return;
+      }
+      setOrb('thinking', `heard: ${text.slice(0, 40)}${text.length > 40 ? '…' : ''}`);
+      window.jarvis.notify('JARVIS heard you', text.length > 80 ? `${text.slice(0, 80)}…` : text);
+      await sendConvo(text);
+    } catch (e) {
+      addMsg('jarvis', `Couldn't hear that: ${e.message}`);
+      window.jarvis.notify('JARVIS', `Transcription failed: ${e.message}`);
+      endConvo();
+      return;
+    }
+    if (convoActive) startConvoTurn();
+    else setOrb('idle', 'click to talk');
+  }
+
+  // ── chat mic button (manual push-to-talk, no auto-stop) ──────────────
+  let chatRecorder = null;
+
+  async function toggleMic() {
+    if (document.body.classList.contains('mode-dictate')) return; // dictation owns the mic
+    if (chatRecorder) {
+      $('micBtn').classList.remove('rec');
+      const samples = chatRecorder.stop();
+      chatRecorder = null;
+      await finishChatMic(samples);
+      return;
+    }
+    chatRecorder = createManualPcmRecorder();
+    try { await chatRecorder.start(); }
+    catch { addMsg('jarvis', 'Mic blocked — allow microphone access for JARVIS in Windows settings.'); chatRecorder = null; return; }
+    $('micBtn').classList.add('rec');
+  }
+
+  async function finishChatMic(samples) {
+    if (samples.length < MIN_SAMPLES) return;
+    inputEl.placeholder = 'Transcribing…';
+    try {
+      const text = await transcribeSamples(samples);
+      if (text) send(text);
+    } catch (e) {
+      addMsg('jarvis', `Couldn't hear that: ${e.message}`);
+    } finally {
+      inputEl.placeholder = 'Ask or command…';
+    }
+  }
+
+  // ── dictation (double-tap Right Ctrl, non-focusable orb mode) ────────
+  // Manual stop: double-tap Right Ctrl (main.js dictate-force-stop) or a
+  // click anywhere on the window — the window is non-focusable but still
+  // receives mouse events, and .shell is display:none in this mode so body
+  // itself is the only hit target. No auto-stop-on-silence, no calibration,
+  // no timeout.
+  let dictRecorder = null;
+
+  document.body.addEventListener('click', () => {
+    if (document.body.classList.contains('mode-dictate') && dictRecorder) stopDictation();
+  });
+
+  async function startDictation() {
+    if (dictRecorder) return;
+    dictRecorder = createManualPcmRecorder();
+    try {
+      await dictRecorder.start();
+      startSpeakPulse(dictRecorder.rawLevel); // glow swells with the dictated voice, same as orb listening
+    }
+    catch {
+      window.jarvis.notify('JARVIS dictation failed', 'Mic blocked — allow microphone access for JARVIS in Windows settings.');
+      dictRecorder = null;
+      window.jarvis.dictateDone();
+    }
+  }
+
+  // Also the mode-conflict teardown path (hide/blur/switch-to-chat mid-dictation
+  // routes here via main.js's dictate-force-stop) — always finalizes the turn.
+  async function stopDictation() {
+    if (!dictRecorder) { window.jarvis.dictateDone(); return; }
+    const samples = dictRecorder.stop();
+    stopSpeakPulse();
+    dictRecorder = null;
+    await finishDictation(samples);
+  }
+
+  async function finishDictation(samples) {
+    if (samples.length < MIN_SAMPLES) {
+      window.jarvis.notify('JARVIS', "Didn't catch that — try again.");
+      window.jarvis.dictateDone();
+      return;
+    }
+    setOrb('thinking');
+    try {
+      const text = await transcribeSamples(samples);
+      if (text) {
+        await window.jarvis.typeText(text);
+        window.jarvis.notify('JARVIS heard you', `${text.slice(0, 80)}${text.length > 80 ? '… ' : ' '}— typing it`);
+      } else {
+        window.jarvis.notify('JARVIS', "Didn't catch that — try again.");
+      }
+    } catch (e) {
+      window.jarvis.notify('JARVIS dictation failed', `Transcription failed: ${e.message || 'local error'}`);
+    } finally {
+      window.jarvis.dictateDone();
+    }
+  }
+
+  // ── auth flow ─────────────────────────────────────────────────
+  function showAuthed(user) {
+    uid = user.uid;
+    $('auth').style.display = 'none';
+    chatEl.style.display = 'flex';
+    $('inputRow').style.display = 'flex';
+    if (!chatEl.childElementCount) {
+      addMsg('jarvis', `JARVIS online. Connected to Ascend as ${user.email}.\nSet reminders, ask anything, or press Ctrl+Shift+Space in any app to dictate.`);
+    }
+    watchReminders();
+  }
+
+  onAuthStateChanged(auth, (user) => {
+    if (user) showAuthed(user);
+    else { $('auth').style.display = 'flex'; chatEl.style.display = 'none'; $('inputRow').style.display = 'none'; }
+  });
+
+  $('loginBtn').addEventListener('click', async () => {
+    $('authErr').textContent = '';
+    try { await signInWithEmailAndPassword(auth, $('email').value.trim(), $('pass').value); }
+    catch (e) { $('authErr').textContent = e.message.replace('Firebase: ', ''); }
+  });
+  $('pass').addEventListener('keydown', (e) => e.key === 'Enter' && $('loginBtn').click());
+
+  // ── wiring ────────────────────────────────────────────────────
+  $('sendBtn').addEventListener('click', () => send(inputEl.value));
+  inputEl.addEventListener('keydown', (e) => e.key === 'Enter' && send(inputEl.value));
+  $('micBtn').addEventListener('click', toggleMic);
+  $('hideBtn').addEventListener('click', () => window.jarvis.hide()); // ✕ hides fully now — no more orb view to collapse to
+  $('muteBtn').addEventListener('click', () => {
+    muted = !muted;
+    $('muteBtn').textContent = muted ? '🔇' : '🔊';
+    if (muted) stopSpeaking();
+  });
+  document.addEventListener('keydown', (e) => e.key === 'Escape' && window.jarvis.hide());
+  window.jarvis.onDictateForceStop(stopDictation);
+  window.jarvis.onHiding(() => {
+    // Window is about to hide (blur/Esc/double-tap) — don't let the mic keep
+    // recording behind it with no visible status.
+    if (convoActive) endConvo();
+    if (chatRecorder) { chatRecorder.stop(); chatRecorder = null; $('micBtn').classList.remove('rec'); }
+  });
+  window.jarvis.onMode((payload) => {
+    const mode = (payload && payload.mode) || 'orb';
+    document.body.classList.remove('mode-orb', 'mode-chat', 'mode-dictate');
+    document.body.classList.add(`mode-${mode}`);
+    if (mode === 'chat') inputEl.focus();
+    if (mode === 'dictate') {
+      // Entering dictation must not leave another mic path running behind it —
+      // otherwise two mic taps record at once and Jarvis can keep talking
+      // over the dictation via a still-active conversation loop.
+      if (convoActive) endConvo();
+      if (chatRecorder) { chatRecorder.stop(); chatRecorder = null; $('micBtn').classList.remove('rec'); }
+      setOrb('listening');
+      startDictation();
+    }
+    // 'orb' mode has no visible click target anymore (tray's "Talk to JARVIS"
+    // opens it directly) — auto-start the conversation loop instead of
+    // waiting for a click that can no longer happen.
+    if (mode === 'orb' && !convoActive) orbClick();
+  });
+  if ('speechSynthesis' in window) speechSynthesis.getVoices(); // warm voice list
+</script>
+</body>
+</html>
