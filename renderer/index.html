@@ -85,7 +85,7 @@
     getAuth, signInWithEmailAndPassword, onAuthStateChanged,
   } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js';
   import {
-    getFirestore, collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, query, where,
+    getFirestore, collection, onSnapshot, addDoc, updateDoc, deleteDoc, deleteField, doc, query, where,
   } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
 
   const CFG = window.JARVIS_CONFIG;
@@ -110,6 +110,8 @@
   let thinking = false;
   let reminders = [];           // live cache from Firestore
   const timers = new Map();     // reminder id -> timeout handle
+  let habits = [];               // live cache: users/{uid}/arenaHabits
+  let todayValues = {};          // live cache: users/{uid}/arenaDays/{today}.values
 
   // ── UI helpers ────────────────────────────────────────────────
   function addMsg(role, content) {
@@ -243,7 +245,12 @@
   // onDone fires once the reply has finished being spoken (or immediately if
   // muted/superseded) — the orb-conversation loop uses it to re-arm the mic.
   function speak(text, onDone) {
-    if (muted) { if (onDone) onDone(); return; }
+    if (muted) {
+      setOrb('speaking');
+      const ms = Math.min(4000, Math.max(700, text.length * 35));
+      setTimeout(() => { setOrb('idle'); if (onDone) onDone(); }, ms);
+      return;
+    }
     stopSpeaking();
     pendingSpeakDone = onDone || null;
     speakEleven(text, speakGen, () => { pendingSpeakDone = null; if (onDone) onDone(); });
@@ -252,6 +259,26 @@
   // ── reminders (Firestore users/{uid}/reminders) ───────────────
   // Doc shape: { text, dueAt: ISO string, done: bool, notified: bool, createdAt: ISO, source: 'desktop'|'web' }
   function remindersRef() { return collection(db, 'users', uid, 'reminders'); }
+  function habitsRef() { return collection(db, 'users', uid, 'arenaHabits'); }
+  function todayDayRef() { return doc(db, 'users', uid, 'arenaDays', todayStr()); }
+
+  /** Local YYYY-MM-DD — must match Ascend's logic/dates.ts::todayStr exactly,
+   *  since both apps key the same Firestore day docs off it. */
+  function todayStr() {
+    const d = new Date();
+    return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+  }
+
+  /** Started, not yet expired. Does not replicate Ascend's week-scoped
+   *  removal grace period (logic/tiles.ts::isHabitActiveOn) — a habit wound
+   *  down mid-week may still show here briefly. Ascend's own Arena tab stays
+   *  the source of truth for tile/streak accounting; this just needs to
+   *  answer "what are my habits" correctly for a voice/chat reply. */
+  function isHabitActive(h, today) {
+    if (today < String(h.startsAt || '').slice(0, 10)) return false;
+    if (h.expiresAt && today >= String(h.expiresAt).slice(0, 10)) return false;
+    return true;
+  }
 
   function scheduleReminder(id, r) {
     if (timers.has(id)) { clearTimeout(timers.get(id)); timers.delete(id); }
@@ -274,6 +301,15 @@
     else timers.set(id, setTimeout(() => scheduleReminder(id, r), MAX_TIMEOUT_MS));
   }
 
+  function watchArena() {
+    onSnapshot(habitsRef(), (snap) => {
+      habits = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    }, (err) => console.warn('[arena] habits listener error:', err.message));
+    onSnapshot(todayDayRef(), (snap) => {
+      todayValues = snap.exists() ? (snap.data().values || {}) : {};
+    }, (err) => console.warn('[arena] today listener error:', err.message));
+  }
+
   function watchReminders() {
     const q = query(remindersRef(), where('done', '==', false));
     onSnapshot(q, (snap) => {
@@ -293,6 +329,10 @@
     { name: 'complete_reminder', module: 'reminders', description: 'Mark a pending reminder as done', parameters: { match: 'words from the reminder text' } },
     { name: 'delete_reminder', module: 'reminders', description: 'Delete a pending reminder entirely', parameters: { match: 'words from the reminder text' } },
     { name: 'type_text', module: 'desktop', description: 'Type the given text into the app the user was last using (dictation-style). Use when asked to write/type something for the user in another app', parameters: { text: 'the exact text to type' } },
+    { name: 'add_habit', module: 'arena', description: 'Add a new habit to the Arena habit tracker. Use for "track X", "add a habit", "start doing X".', parameters: { label: 'the habit name, e.g. "Read 30 minutes"', target: 'optional number of reps needed per day (default 1)', unit: 'optional unit for counter habits, e.g. "glasses"' } },
+    { name: 'edit_habit', module: 'arena', description: 'Edit an existing Arena habit: name, target, or unit. Match the habit by name.', parameters: { match: 'words from the current habit name to find it', label: 'optional new name', target: 'optional new daily target', unit: 'optional new unit' } },
+    { name: 'remove_habit', module: 'arena', description: 'Wind down an Arena habit — it keeps counting through the rest of this week, then stops. Use for "remove/stop/drop my X habit" as a deliberate choice, not a mistake.', parameters: { match: 'words from the habit name to find it' } },
+    { name: 'delete_habit', module: 'arena', description: 'Delete an Arena habit outright, immediately, with no penalty. Use only when the user says it was added by mistake.', parameters: { match: 'words from the habit name to find it' } },
   ];
 
   async function runTool(call) {
@@ -322,6 +362,49 @@
         const ok = await window.jarvis.typeText(String(args.text));
         return ok ? 'typed' : 'copied to clipboard (paste with Ctrl+V)';
       }
+      case 'add_habit': {
+        if (!args.label) return 'habit name is required';
+        const target = Math.max(1, Math.round(Number(args.target) || 1));
+        await addDoc(habitsRef(), {
+          label: String(args.label).trim(), kind: 'good', icon: 'check', color: '#10b981',
+          ...(target > 1 ? { target } : {}),
+          ...(args.unit ? { unit: String(args.unit) } : {}),
+          startsAt: todayStr(), createdAt: new Date().toISOString(),
+        });
+        return `added "${String(args.label).trim()}"`;
+      }
+      case 'edit_habit': {
+        if (!args.match) return 'no habit name given';
+        const hit = habits.find(h => fuzzy(h.label, String(args.match)));
+        if (!hit) return 'no matching habit';
+        const fields = {};
+        if (args.label) fields.label = String(args.label).trim();
+        // undefined isn't a legal Firestore field value — deleteField() is the
+        // real "clear this" signal, same fix Ascend's own updateHabit uses.
+        if (args.target !== undefined) {
+          const n = Math.round(Number(args.target) || 0);
+          fields.target = n > 1 ? n : deleteField();
+          if (n <= 1) fields.unit = deleteField();
+        }
+        if (args.unit) fields.unit = String(args.unit);
+        if (!Object.keys(fields).length) return 'nothing to change';
+        await updateDoc(doc(db, 'users', uid, 'arenaHabits', hit.id), fields);
+        return `updated "${hit.label}"`;
+      }
+      case 'remove_habit': {
+        if (!args.match) return 'no habit name given';
+        const hit = habits.find(h => fuzzy(h.label, String(args.match)));
+        if (!hit) return 'no matching habit';
+        await updateDoc(doc(db, 'users', uid, 'arenaHabits', hit.id), { removedAt: new Date().toISOString() });
+        return `"${hit.label}" wound down — counts through this week, then stops`;
+      }
+      case 'delete_habit': {
+        if (!args.match) return 'no habit name given';
+        const hit = habits.find(h => fuzzy(h.label, String(args.match)));
+        if (!hit) return 'no matching habit';
+        await deleteDoc(doc(db, 'users', uid, 'arenaHabits', hit.id));
+        return `deleted "${hit.label}"`;
+      }
       default: return `unknown tool: ${call.tool}`;
     }
   }
@@ -336,11 +419,19 @@
     inputEl.value = '';
     thinking = true; orb.classList.add('thinking');
 
+    const today = todayStr();
+    const activeHabits = habits.filter((h) => isHabitActive(h, today));
+    const doneToday = activeHabits.filter((h) => {
+      const target = h.target && h.target > 0 ? h.target : 1;
+      return (todayValues[h.id] ?? 0) >= target;
+    }).length;
+
     const context = {
       now: new Date().toString(),
       timezoneOffsetMinutes: new Date().getTimezoneOffset(),
       surface: 'desktop app (Windows). You can set reminders and type text into other apps.',
       pendingReminders: reminders.map(r => ({ text: r.text, dueAt: r.dueAt })),
+      arena: { habits: activeHabits.map((h) => h.label), doneToday, totalHabits: activeHabits.length },
     };
 
     try {
@@ -729,6 +820,7 @@
       addMsg('jarvis', `JARVIS online. Connected to Ascend as ${user.email}.\nSet reminders, ask anything, or press Ctrl+Shift+Space in any app to dictate.`);
     }
     watchReminders();
+    watchArena();
   }
 
   onAuthStateChanged(auth, (user) => {
