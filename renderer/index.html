@@ -123,6 +123,8 @@
   // its own, unrelated to the others) — a shared cooldown would let one slow
   // route wrongly suppress checks on the rest for 30s.
   const postStudioDownUntil = new Map();
+  let lastCapturedNote = null;  // { note_id, body, at } — so "draft it" doesn't need the id repeated
+  let recentDrafts = [];        // last 5 draftPost results — so "read it back" works with no GET /api/draft/:id
 
   async function fetchPostStudio(path) {
     const until = postStudioDownUntil.get(path) ?? 0;
@@ -373,6 +375,36 @@
     { name: 'edit_habit', module: 'arena', description: 'Edit an existing Arena habit: name, target, or unit. Match the habit by name.', parameters: { match: 'words from the current habit name to find it', label: 'optional new name', target: 'optional new daily target', unit: 'optional new unit' } },
     { name: 'remove_habit', module: 'arena', description: 'Wind down an Arena habit — it keeps counting through the rest of this week, then stops. Use for "remove/stop/drop my X habit" as a deliberate choice, not a mistake.', parameters: { match: 'words from the habit name to find it' } },
     { name: 'delete_habit', module: 'arena', description: 'Delete an Arena habit outright, immediately, with no penalty. Use only when the user says it was added by mistake.', parameters: { match: 'words from the habit name to find it' } },
+    {
+      name: 'captureNote',
+      module: 'PostStudio',
+      description: "Save what the user says they did as a weekly note, the input a LinkedIn/newsletter/Dev.to draft gets written from. Always call this before draftPost — draftPost needs the noteId this returns. If it errors that the note is too short, tell the user and ask for a few more concrete sentences; do not retry with the same text.",
+      parameters: {
+        body: 'what they actually did, in their own words — needs real specifics (a number, a concrete outcome), not a one-line summary',
+        angle: 'optional: a specific slant to write from, e.g. "focus on the debugging story"',
+      },
+    },
+    {
+      name: 'draftPost',
+      module: 'PostStudio',
+      description: "Turn a saved note into a draft post. Requires a noteId from captureNote first. Returns one draft per channel; a draft can come back in state 'rejected' with reasons in outstanding — that's a normal outcome, not a failure, relay the reasons if asked. Nothing is ever published by this call; drafts require separate human approval inside Post Studio.",
+      parameters: {
+        noteId: 'the note_id returned by captureNote',
+        channels: 'optional array from "linkedin", "newsletter", "devto" — defaults to ["linkedin"] if omitted',
+      },
+    },
+    {
+      name: 'applyAdd',
+      module: 'PostStudio',
+      description: "Track a competition, internship, hackathon, scholarship, certification or job in the user's private deadline tracker. This does NOT submit any application anywhere — it only adds a row the user is reminded about. Use for 'remind me about X', 'I want to track this', 'add this deadline'.",
+      parameters: {
+        title: 'the name of the thing, required',
+        organiser: 'optional: who is running it',
+        url: 'optional: link to the listing',
+        due: 'optional deadline — always format as YYYY-MM-DD if a date is known, otherwise omit',
+        kind: 'optional, one of: competition, internship, hackathon, scholarship, certification, job — defaults to competition',
+      },
+    },
   ];
 
   async function runTool(call) {
@@ -445,6 +477,79 @@
         await deleteDoc(doc(db, 'users', uid, 'arenaHabits', hit.id));
         return `deleted "${hit.label}"`;
       }
+      case 'captureNote': {
+        if (!args.body) return 'nothing to note — tell me what you did';
+        try {
+          const res = await fetch(`${POST_STUDIO}/api/note`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ body: String(args.body), ...(args.angle ? { angle: String(args.angle) } : {}) }),
+            signal: AbortSignal.timeout(8000),
+          });
+          const data = await res.json().catch(() => null);
+          // Relay the server's exact wording — it's a real content gate
+          // ("too short to write from"), not a bug to paper over or retry.
+          if (!res.ok) return (data && data.error) || `note failed (HTTP ${res.status})`;
+          lastCapturedNote = { note_id: data.note_id, body: String(args.body), at: new Date().toISOString() };
+          return `noted (id ${data.note_id}) — say "draft it" to turn this into a post`;
+        } catch {
+          return 'Post Studio is not running on this machine. Start it: python scripts/serve.py';
+        }
+      }
+      case 'draftPost': {
+        // Falls back to the note just captured this session — draftPost's own
+        // description tells the model to always call captureNote first, but a
+        // user saying "draft it" a turn later shouldn't have to repeat an
+        // opaque id it never saw.
+        const noteId = args.noteId || (lastCapturedNote && lastCapturedNote.note_id);
+        if (!noteId) return 'no note to draft from yet — tell me what you did first, then ask me to draft it';
+        const channels = Array.isArray(args.channels) && args.channels.length ? args.channels : undefined;
+        try {
+          const res = await fetch(`${POST_STUDIO}/api/draft`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ note_id: noteId, ...(channels ? { channels } : {}) }),
+            signal: AbortSignal.timeout(15000),
+          });
+          const data = await res.json().catch(() => null);
+          if (!res.ok) return (data && data.error) || `draft failed (HTTP ${res.status})`;
+          const drafts = Array.isArray(data.drafts) ? data.drafts : [];
+          // Kept in full (not collapsed to an id) so a later "read it back to
+          // me" can answer from history — there's no GET /api/draft/:id.
+          recentDrafts = [...drafts, ...recentDrafts].slice(0, 5);
+          if (!drafts.length) return 'no drafts came back';
+          return drafts
+            .map((d) =>
+              d.state === 'rejected'
+                ? `${d.channel} draft rejected: ${(d.outstanding || []).join('; ') || 'no reason given'}`
+                : `${d.channel} draft ready (id ${d.draft_id}): "${d.hook}" — needs your approval in Post Studio before it goes anywhere`,
+            )
+            .join(' · ');
+        } catch {
+          return 'Post Studio is not running on this machine. Start it: python scripts/serve.py';
+        }
+      }
+      case 'applyAdd': {
+        if (!args.title) return 'needs a title';
+        try {
+          const res = await fetch(`${POST_STUDIO}/api/apply/add`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              title: String(args.title),
+              ...(args.organiser ? { organiser: String(args.organiser) } : {}),
+              ...(args.url ? { url: String(args.url) } : {}),
+              ...(args.due ? { due: String(args.due) } : {}),
+              ...(args.kind ? { kind: String(args.kind) } : {}),
+            }),
+            signal: AbortSignal.timeout(8000),
+          });
+          const data = await res.json().catch(() => null);
+          if (!res.ok) return (data && data.error) || `add failed (HTTP ${res.status})`;
+          // The response is the whole panel, not the row just added — the
+          // server itself said not to guess which entry is "ours", so don't.
+          return `tracking "${String(args.title)}"`;
+        } catch {
+          return 'Post Studio is not running on this machine. Start it: python scripts/serve.py';
+        }
+      }
       default: return `unknown tool: ${call.tool}`;
     }
   }
@@ -472,7 +577,7 @@
       surface: 'desktop app (Windows). You can set reminders and type text into other apps.',
       pendingReminders: reminders.map(r => ({ text: r.text, dueAt: r.dueAt })),
       arena: { habits: activeHabits.map((h) => h.label), doneToday, totalHabits: activeHabits.length },
-      postStudio: await postStudioStatus(),
+      postStudio: { ...(await postStudioStatus()), lastNote: lastCapturedNote, recentDrafts },
     };
 
     try {
