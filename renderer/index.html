@@ -113,6 +113,46 @@
   let habits = [];               // live cache: users/{uid}/arenaHabits
   let todayValues = {};          // live cache: users/{uid}/arenaDays/{today}.values
 
+  // ── agent-os / Post Studio: read-only status, fetched fresh each message ──
+  // Loopback-only, this machine's own agent-os instance. A 30s cooldown after
+  // a failure keeps a down Post Studio from adding latency to every unrelated
+  // message; 1.5s timeout since this is localhost, not a real network hop.
+  const POST_STUDIO = 'http://127.0.0.1:8765';
+  // Per-path cooldown, not one shared flag: verified against the live server
+  // that these four routes fail independently (/api/classwork times out on
+  // its own, unrelated to the others) — a shared cooldown would let one slow
+  // route wrongly suppress checks on the rest for 30s.
+  const postStudioDownUntil = new Map();
+
+  async function fetchPostStudio(path) {
+    const until = postStudioDownUntil.get(path) ?? 0;
+    if (Date.now() < until) return { error: 'Post Studio is not running on this machine.' };
+    try {
+      const res = await fetch(`${POST_STUDIO}${path}`, { signal: AbortSignal.timeout(1500) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch {
+      postStudioDownUntil.set(path, Date.now() + 30000);
+      return { error: 'Post Studio is not running on this machine. Start it: python scripts/serve.py' };
+    }
+  }
+
+  /**
+   * Sequential, not Promise.all — verified against the real server:
+   * Post Studio is Python's single-threaded http.server (HTTP/1.0, no
+   * keep-alive), so four requests fired at once contend with each other
+   * and the later ones can time out even though the server is healthy.
+   * Never throws; each key degrades to its own {error}.
+   */
+  async function postStudioStatus() {
+    return {
+      inbox: await fetchPostStudio('/api/inbox'),
+      apply: await fetchPostStudio('/api/apply'),
+      classwork: await fetchPostStudio('/api/classwork'),
+      automatic: await fetchPostStudio('/api/automatic'),
+    };
+  }
+
   // ── UI helpers ────────────────────────────────────────────────
   function addMsg(role, content) {
     const div = document.createElement('div');
@@ -432,6 +472,7 @@
       surface: 'desktop app (Windows). You can set reminders and type text into other apps.',
       pendingReminders: reminders.map(r => ({ text: r.text, dueAt: r.dueAt })),
       arena: { habits: activeHabits.map((h) => h.label), doneToday, totalHabits: activeHabits.length },
+      postStudio: await postStudioStatus(),
     };
 
     try {
