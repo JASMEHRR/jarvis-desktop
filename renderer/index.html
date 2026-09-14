@@ -85,7 +85,7 @@
     getAuth, signInWithEmailAndPassword, onAuthStateChanged,
   } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js';
   import {
-    getFirestore, collection, onSnapshot, addDoc, updateDoc, deleteDoc, deleteField, doc, query, where,
+    getFirestore, collection, onSnapshot, addDoc, setDoc, updateDoc, deleteDoc, deleteField, doc, query, where,
   } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
 
   const CFG = window.JARVIS_CONFIG;
@@ -153,6 +153,38 @@
       classwork: await fetchPostStudio('/api/classwork'),
       automatic: await fetchPostStudio('/api/automatic'),
     };
+  }
+
+  /**
+   * Bridge Post Studio -> Firestore, so surfaces that can't reach 127.0.0.1
+   * (the Telegram webhook, running on Vercel) can still see inbox/classwork/
+   * apply status. This app is the only thing that can read both sides.
+   *
+   * Stamped with mirroredAt on purpose: the mirror is only as fresh as the
+   * last time this app was open, and a reader six hours later must be able to
+   * tell that rather than reporting stale classwork as current.
+   */
+  async function mirrorPostStudio(status) {
+    if (!uid) return;
+    try {
+      await setDoc(doc(db, 'users', uid, 'postStudioMirror', 'latest'), {
+        ...status,
+        mirroredAt: new Date().toISOString(),
+        source: 'jarvis-desktop',
+      });
+    } catch (e) {
+      console.warn('[postStudio] mirror write failed:', e.message);
+    }
+  }
+
+  /** Refresh the mirror on a timer so it keeps up even with no chat activity. */
+  const MIRROR_INTERVAL_MS = 5 * 60 * 1000;
+  let mirrorTimer = null;
+  function startPostStudioMirror() {
+    const tick = async () => { await mirrorPostStudio(await postStudioStatus()); };
+    void tick();
+    clearInterval(mirrorTimer);
+    mirrorTimer = setInterval(() => void tick(), MIRROR_INTERVAL_MS);
   }
 
   // ── UI helpers ────────────────────────────────────────────────
@@ -564,6 +596,9 @@
     inputEl.value = '';
     thinking = true; orb.classList.add('thinking');
 
+    const postStudioNow = await postStudioStatus();
+    void mirrorPostStudio(postStudioNow); // fire-and-forget: never delay a reply on the mirror
+
     const today = todayStr();
     const activeHabits = habits.filter((h) => isHabitActive(h, today));
     const doneToday = activeHabits.filter((h) => {
@@ -577,7 +612,7 @@
       surface: 'desktop app (Windows). You can set reminders and type text into other apps.',
       pendingReminders: reminders.map(r => ({ text: r.text, dueAt: r.dueAt })),
       arena: { habits: activeHabits.map((h) => h.label), doneToday, totalHabits: activeHabits.length },
-      postStudio: { ...(await postStudioStatus()), lastNote: lastCapturedNote, recentDrafts },
+      postStudio: { ...postStudioNow, lastNote: lastCapturedNote, recentDrafts },
     };
 
     try {
@@ -967,6 +1002,7 @@
     }
     watchReminders();
     watchArena();
+    startPostStudioMirror();
   }
 
   onAuthStateChanged(auth, (user) => {
