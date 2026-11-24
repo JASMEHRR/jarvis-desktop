@@ -363,8 +363,18 @@
       window.jarvis.reminderDue(r.text);
       addMsg('jarvis', `⏰ Reminder: ${r.text}`);
       speak(`Reminder, sir: ${r.text}`);
-      try { await updateDoc(doc(db, 'users', uid, 'reminders', id), { notified: true }); }
-      catch (e) { console.warn('mark notified failed', e); }
+      try {
+        // A recurring one (repeatMinutes set) reschedules itself instead of
+        // staying fired — this is the only place a repeat actually advances,
+        // so the Telegram cron's reminder check must never mark notified:true
+        // on one of these, or the two paths would race to reschedule it twice.
+        if (r.repeatMinutes > 0) {
+          const nextDue = new Date(Date.now() + r.repeatMinutes * 60000).toISOString();
+          await updateDoc(doc(db, 'users', uid, 'reminders', id), { dueAt: nextDue, notified: false });
+        } else {
+          await updateDoc(doc(db, 'users', uid, 'reminders', id), { notified: true });
+        }
+      } catch (e) { console.warn('mark notified failed', e); }
     };
     const MAX_TIMEOUT_MS = 2147000000; // setTimeout's 32-bit signed-int cap (~24.8 days)
     if (delay <= 0) fire();                       // missed while app was closed → fire late
